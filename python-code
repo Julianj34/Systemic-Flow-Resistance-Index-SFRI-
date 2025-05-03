@@ -1,0 +1,57 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import argparse
+import os
+
+# Load and process a CSV file to compute and visualize SFRI
+
+def load_sfri_data(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    
+    df = pd.read_csv(file_path, parse_dates=['Open Time'])
+    df.set_index('Open Time', inplace=True)
+
+    # Ensure correct data types
+    df['Close'] = df['Close'].astype(float)
+    if 'SFRI' not in df.columns:
+        if {'High', 'Low', 'Volume'}.issubset(df.columns):
+            df['Price Change'] = df['Close'].diff()
+            df['Spread'] = df['High'] - df['Low']
+            df['Effective Flow'] = df['Volume'] * df['Price Change'].abs()
+            df['SFRI'] = (df['Price Change'].abs() * df['Spread']) / (df['Effective Flow'] + 1e-6)
+            df['SFRI'] *= 10000  # scale for visibility
+        else:
+            raise ValueError("CSV must contain either SFRI or High, Low, Volume columns to calculate it.")
+    else:
+        df['SFRI'] = df['SFRI'].astype(float)
+
+    return df
+
+# Plot SFRI values
+def plot_sfri(df, title="Systemic Flow Resistance Index (SFRI)", output_file=None):
+    plt.figure(figsize=(12, 6))
+    plt.plot(df.index, df['SFRI'], label='SFRI', linewidth=2)
+    plt.title(title)
+    plt.xlabel("Time")
+    plt.ylabel("SFRI (scaled)")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    if output_file:
+        plt.savefig(output_file)
+        print(f"Plot saved to {output_file}")
+    else:
+        plt.show()
+
+# Main execution
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Visualize or calculate the Systemic Flow Resistance Index (SFRI).")
+    parser.add_argument("--input", required=True, help="Path to input CSV file")
+    parser.add_argument("--output", help="Optional path to save the plot as an image file")
+    args = parser.parse_args()
+
+    df = load_sfri_data(args.input)
+    print("Latest SFRI values:")
+    print(df[['Close', 'SFRI']].tail())
+    plot_sfri(df, output_file=args.output)
