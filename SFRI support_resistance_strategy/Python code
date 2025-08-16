@@ -1,0 +1,489 @@
+import argparse
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import vectorbt as vbt
+
+
+# =============================
+# Data IO & SFRI
+# =============================
+
+def load_data_from_csv(file_path: str) -> pd.DataFrame:
+    """Load OHLCV CSV with a datetime index called 'Open Time'."""
+    df = pd.read_csv(file_path)
+    df.columns = df.columns.str.strip()
+    if 'Open Time' not in df.columns:
+        raise ValueError("CSV must contain 'Open Time' column.")
+    df['Open Time'] = pd.to_datetime(df['Open Time'])
+    df.set_index('Open Time', inplace=True)
+    for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
+        if col not in df.columns:
+            raise ValueError(f"CSV must contain '{col}' column.")
+        df[col] = df[col].astype(float)
+    df = df.sort_index()
+    return df
+
+
+def compute_sfri(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute SFRI from OHLCV if missing.
+    SFRI ~ (|ΔP| * Spread) / (Volume * |ΔP| + eps), scaled for visibility.
+    """
+    df = df.copy()
+    if 'SFRI' not in df.columns:
+        eps = 1e-12
+        price_change = df['Close'].diff().abs()
+        spread = (df['High'] - df['Low']).clip(lower=0)
+        eff_flow = (df['Volume'] * price_change).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+        df['SFRI'] = (price_change * spread) / (eff_flow + eps)
+        df['SFRI'] *= 10_000.0
+    return df
+
+
+# =============================
+# Helpers (repaint-safe)
+# =============================
+
+def zscore(s: pd.Series, window: int = 50, min_periods: int = None) -> pd.Series:
+    """Standard z-score with safe defaults & NaN/Inf handling."""
+    window = int(round(window))
+    if min_periods is None:
+        min_periods = max(10, window // 2)
+    min_periods = int(min_periods)
+    m = s.rolling(window=window, min_periods=min_periods).mean()
+    sd = s.rolling(window=window, min_periods=min_periods).std(ddof=0)
+    z = (s - m) / sd
+    return z.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+
+def find_swings_strict_nopeek(price: pd.Series,
+                              sfriz: pd.Series,
+                              lookback: int = 2,
+                              sfriz_abs_min: float = 0.5) -> Tuple[pd.Series, pd.Series]:
+    """Strict pivots with no look-ahead.
+    A pivot at t0 must be strictly greater/less than all neighbors in a centered window.
+    Confirmation lag: signals shift forward by `lookback` bars.
+    Returns (confirmed_high_price_series, confirmed_low_price_series).
+    """
+    lookback = int(lookback)
+    w = int(2 * lookback + 1)
+
+    hi_raw = price.rolling(window=w, center=True).apply(
+        lambda x: 1.0 if np.all(x[lookback] > np.delete(x, lookback)) else 0.0, raw=True
+    ).fillna(0).astype(bool)
+    lo_raw = price.rolling(window=w, center=True).apply(
+        lambda x: 1.0 if np.all(x[lookback] < np.delete(x, lookback)) else 0.0, raw=True
+    ).fillna(0).astype(bool)
+
+    hi_price_raw = price.where(hi_raw).where(sfriz.abs() >= float(sfriz_abs_min))
+    lo_price_raw = price.where(lo_raw).where(sfriz.abs() >= float(sfriz_abs_min))
+
+    # confirmation lag: usable only from t0 + lookback
+    hi_price_conf = hi_price_raw.shift(lookback)
+    lo_price_conf = lo_price_raw.shift(lookback)
+    return hi_price_conf, lo_price_conf
+
+
+def last_valid_level_from_prices(level_price_series: pd.Series,
+                                 index: pd.Index,
+                                 window_days: int) -> Tuple[pd.Series, pd.Series]:
+    """Forward-fill last pivot price and invalidate if older than `window_days`."""
+    window_days = int(window_days)
+    t = index.to_series()
+    level_time = t.where(level_price_series.notna()).ffill()
+    age_days = (t - level_time).dt.total_seconds() / 86400.0
+    lvl_price = level_price_series.ffill().where(age_days <= window_days)
+    return lvl_price, age_days
+
+
+# =============================
+# Strategy core
+# =============================
+
+@dataclass
+class Params:
+    sr_window_days: int = 60
+    lookback_swings: int = 1
+    sfriz_window: int = 96
+    sfriz_swing_min: float = 1.0
+    band_pct: float = 0.005
+    sfriz_bounce_long: float = -2.0
+    sfriz_bounce_short: float = 2.0
+    sfriz_breakout_lo: float = -1.0
+    sfriz_breakout_hi: float = 1.0
+    sl_pct: float = 0.05
+    tp_pct: float = 0.15
+    max_hold_bars: int = 24
+    prefer_long_on_conflict: bool = True
+
+
+def build_signals(df: pd.DataFrame, P: Params):
+    """Build S/R zones and bar-close entries without look-ahead."""
+    close = df['Close']
+    sfriz = zscore(df['SFRI'], window=P.sfriz_window)
+
+    hi_conf, lo_conf = find_swings_strict_nopeek(
+        price=close,
+        sfriz=sfriz,
+        lookback=P.lookback_swings,
+        sfriz_abs_min=P.sfriz_swing_min
+    )
+    res_price, _ = last_valid_level_from_prices(hi_conf, df.index, P.sr_window_days)
+    sup_price, _ = last_valid_level_from_prices(lo_conf, df.index, P.sr_window_days)
+
+    # zone bands / thresholds
+    res_low  = res_price * (1 - P.band_pct)
+    res_high = res_price * (1 + P.band_pct)
+    sup_low  = sup_price * (1 - P.band_pct)
+    sup_high = sup_price * (1 + P.band_pct)
+    res_thr  = res_price * (1 + P.band_pct / 4)  # long breakout minimal above R
+    sup_thr  = sup_price * (1 - P.band_pct / 4)  # short breakdown minimal below S
+
+    # entries (bar-close)
+    breakout_long = (
+        res_price.notna() &
+        (close.shift(1) <= res_thr.shift(1)) &
+        (close > res_thr) &
+        (sfriz.between(P.sfriz_breakout_lo, P.sfriz_breakout_hi))
+    )
+    bounce_long = (
+        sup_price.notna() &
+        (close.shift(1) < sup_low.shift(1)) &
+        (close >= sup_low) &
+        (close <= sup_high) &
+        (sfriz <= P.sfriz_bounce_long)
+    )
+    long_entries = (breakout_long | bounce_long).fillna(False)
+
+    rejection_short = (
+        res_price.notna() &
+        (close.shift(1) > res_high.shift(1)) &
+        (close <= res_high) &
+        (close >= res_low) &
+        (sfriz >= P.sfriz_bounce_short)
+    )
+    breakdown_short = (
+        sup_price.notna() &
+        (close.shift(1) >= sup_thr.shift(1)) &
+        (close < sup_thr) &
+        (sfriz.between(P.sfriz_breakout_lo, P.sfriz_breakout_hi))
+    )
+    short_entries = (rejection_short | breakdown_short).fillna(False)
+
+    # conflict resolution (same bar)
+    conflict = long_entries & short_entries
+    if P.prefer_long_on_conflict:
+        short_entries = short_entries & ~conflict
+    else:
+        long_entries = long_entries & ~conflict
+
+    return {
+        'close': close, 'sfriz': sfriz,
+        'res_low': res_low, 'res_high': res_high,
+        'sup_low': sup_low, 'sup_high': sup_high,
+        'long_entries': long_entries,
+        'short_entries': short_entries,
+    }
+
+
+def build_exits_sequential(close: pd.Series,
+                           long_entries: pd.Series,
+                           short_entries: pd.Series,
+                           P: Params) -> Tuple[pd.Series, pd.Series]:
+    """Sequential exits per side: SL / TP / Max-hold. One position at a time per side."""
+    n = len(close)
+    long_exits = np.zeros(n, dtype=bool)
+    short_exits = np.zeros(n, dtype=bool)
+
+    # Long side
+    i = 0
+    while i < n:
+        if long_entries.iat[i]:
+            entry_idx = i
+            entry_price = close.iat[entry_idx]
+            exit_idx = None
+            max_exit_idx = min(entry_idx + P.max_hold_bars, n - 1)
+            for j in range(1, P.max_hold_bars + 1):
+                k = entry_idx + j
+                if k >= n:
+                    break
+                ret = (close.iat[k] - entry_price) / entry_price
+                if ret <= -P.sl_pct or ret >= P.tp_pct:
+                    exit_idx = k
+                    break
+            if exit_idx is None or exit_idx > max_exit_idx:
+                exit_idx = max_exit_idx
+            long_exits[exit_idx] = True
+            i = exit_idx + 1
+        else:
+            i += 1
+
+    # Short side
+    i = 0
+    while i < n:
+        if short_entries.iat[i]:
+            entry_idx = i
+            entry_price = close.iat[entry_idx]
+            exit_idx = None
+            max_exit_idx = min(entry_idx + P.max_hold_bars, n - 1)
+            for j in range(1, P.max_hold_bars + 1):
+                k = entry_idx + j
+                if k >= n:
+                    break
+                ret_short = (entry_price - close.iat[k]) / entry_price
+                if ret_short <= -P.sl_pct or ret_short >= P.tp_pct:
+                    exit_idx = k
+                    break
+            if exit_idx is None or exit_idx > max_exit_idx:
+                exit_idx = max_exit_idx
+            short_exits[exit_idx] = True
+            i = exit_idx + 1
+        else:
+            i += 1
+
+    return pd.Series(long_exits, index=close.index), pd.Series(short_exits, index=close.index)
+
+
+def run_backtest(df: pd.DataFrame,
+                 P: Params,
+                 dollars_per_trade: float = 1000.0,
+                 fees: float = 0.001,
+                 slippage: float = 0.0,
+                 tf_freq: str = "4H"):
+
+    df = compute_sfri(df)
+    df['SFRI_Z'] = zscore(df['SFRI'], window=P.sfriz_window)
+
+    sig = build_signals(df, P)
+    long_exits, short_exits = build_exits_sequential(
+        sig['close'], sig['long_entries'], sig['short_entries'], P
+    )
+
+    # single size array for both long & short (vectorbt expects one)
+    size_arr = np.where(
+        (sig['long_entries'] | sig['short_entries']).values,
+        dollars_per_trade / sig['close'].values,
+        0.0
+    )
+
+    pf = vbt.Portfolio.from_signals(
+        close=sig['close'],
+        entries=sig['long_entries'].values,
+        exits=long_exits.values,
+        short_entries=sig['short_entries'].values,
+        short_exits=short_exits.values,
+        size=size_arr,
+        init_cash=10_000.0,
+        fees=fees,
+        slippage=slippage,
+        freq=tf_freq.upper(),
+    )
+    return pf, sig, long_exits, short_exits
+
+
+# =============================
+# Plotting
+# =============================
+
+def plot_strategy_chart(index, close, sfriz,
+                        res_low, res_high, sup_low, sup_high,
+                        long_entries, long_exits, short_entries, short_exits,
+                        title="SFRI-weighted Long/Short S/R (repaint-safe, $100/trade)"):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(13, 9), sharex=True)
+    ax1.plot(index, close, linewidth=1.4, label="Close")
+    if pd.Series(res_low).notna().any() and pd.Series(res_high).notna().any():
+        ax1.fill_between(index, res_low, res_high, alpha=0.12, label="Resistance zone")
+    if pd.Series(sup_low).notna().any() and pd.Series(sup_high).notna().any():
+        ax1.fill_between(index, sup_low, sup_high, alpha=0.18, label="Support zone")
+
+    le_idx = np.where(long_entries)[0]; lx_idx = np.where(long_exits)[0]
+    se_idx = np.where(short_entries)[0]; sx_idx = np.where(short_exits)[0]
+    ax1.scatter(index[le_idx], close.iloc[le_idx], marker='^', s=60, label="Long entry")
+    ax1.scatter(index[lx_idx], close.iloc[lx_idx], marker='v', s=60, label="Long exit")
+    ax1.scatter(index[se_idx], close.iloc[se_idx], marker='x', s=60, label="Short entry")
+    ax1.scatter(index[sx_idx], close.iloc[sx_idx], marker='o', s=55, label="Short exit")
+
+    ax1.set_title(title); ax1.set_ylabel("Price"); ax1.legend(loc="best")
+    ax2.plot(index, sfriz, linewidth=1.0, label="SFRI_Z")
+    ax2.axhline(0.0, linestyle='--', linewidth=1.0)
+    ax2.axhline( 2.0, linestyle=':',  linewidth=1.0)
+    ax2.axhline(-2.0, linestyle=':',  linewidth=1.0)
+    ax2.set_title("SFRI (z-score)"); ax2.set_ylabel("Z")
+    plt.tight_layout(); plt.show()
+
+
+# =============================
+# Realtime (bar-close)
+# =============================
+
+@dataclass
+class RTState:
+    side: str = None          # None / 'long' / 'short'
+    entry_price: float = None
+    entry_time: pd.Timestamp = None
+    bars_held: int = 0
+    sl_price: float = None
+    tp_price: float = None
+    qty: float = 0.0
+
+
+def realtime_step(df: pd.DataFrame,
+                  state: RTState,
+                  P: Params,
+                  dollars_per_trade: float = 1000.0):
+    """Call on each NEWLY CLOSED bar (df must contain closed bars only)."""
+    df = compute_sfri(df)
+    if 'SFRI_Z' not in df.columns:
+        df['SFRI_Z'] = zscore(df['SFRI'], window=P.sfriz_window)
+
+    sig = build_signals(df, P)
+    close_now = float(sig['close'].iloc[-1])
+    t_now = df.index[-1]
+
+    # Entry
+    if state.side is None:
+        wants_long = bool(sig['long_entries'].iloc[-1])
+        wants_short = bool(sig['short_entries'].iloc[-1])
+        if wants_long or wants_short:
+            side = 'long' if (wants_long and (P.prefer_long_on_conflict or not wants_short)) else 'short'
+            qty = dollars_per_trade / close_now
+            if side == 'long':
+                sl = close_now * (1 - P.sl_pct)
+                tp = close_now * (1 + P.tp_pct)
+            else:
+                sl = close_now * (1 + P.sl_pct)
+                tp = close_now * (1 - P.tp_pct)
+            state = RTState(side=side, entry_price=close_now, entry_time=t_now,
+                            bars_held=0, sl_price=sl, tp_price=tp, qty=qty)
+            return {'action': f'enter_{side}', 'time': t_now, 'price': close_now,
+                    'qty': qty, 'sl': sl, 'tp': tp}, state
+        return {'action': 'hold', 'time': t_now, 'price': close_now}, state
+
+    # Exit
+    state.bars_held += 1
+    exit_reason = None
+    if state.side == 'long':
+        if close_now <= state.sl_price: exit_reason = 'stop'
+        elif close_now >= state.tp_price: exit_reason = 'take'
+    elif state.side == 'short':
+        if close_now >= state.sl_price: exit_reason = 'stop'
+        elif close_now <= state.tp_price: exit_reason = 'take'
+    if exit_reason is None and state.bars_held >= P.max_hold_bars:
+        exit_reason = 'time'
+
+    if exit_reason is not None:
+        action = {'action': 'exit', 'side': state.side, 'reason': exit_reason,
+                  'time': t_now, 'price': close_now, 'qty': state.qty}
+        state = RTState()  # reset
+        return action, state
+
+    return {'action': 'hold', 'time': t_now, 'price': close_now,
+            'position': state.side, 'bars_held': state.bars_held,
+            'sl': state.sl_price, 'tp': state.tp_price, 'qty': state.qty}, state
+
+
+# =============================
+# CLI
+# =============================
+
+def parse_args():
+    p = argparse.ArgumentParser(description="SFRI-weighted S/R Long-Short Strategy (repaint-safe)")
+    p.add_argument("--csv", required=True, help="Path to OHLCV CSV (must contain Open Time, O/H/L/C/Volume)")
+    p.add_argument("--freq", default="4H", help="Pandas offset alias for bar frequency (e.g., 4H, 12H, 1D)")
+
+    # core params
+    p.add_argument("--sr-days", type=int, default=120)
+    p.add_argument("--lookback", type=int, default=3)
+    p.add_argument("--zwin", type=int, default=96, help="SFRI z-score window")
+    p.add_argument("--swing-z", type=float, default=1.0)
+    p.add_argument("--band", type=float, default=0.004)
+    p.add_argument("--bounce-long", type=float, default=-1.5)
+    p.add_argument("--bounce-short", type=float, default=2.0)
+    p.add_argument("--brk-lo", type=float, default=-1.5)
+    p.add_argument("--brk-hi", type=float, default=1.0)
+    p.add_argument("--sl", type=float, default=0.03)
+    p.add_argument("--tp", type=float, default=0.08)
+    p.add_argument("--hold", type=int, default=24)
+    p.add_argument("--prefer-long", action="store_true", default=True, help="Prefer long if both sides trigger")
+
+    # trading & io
+    p.add_argument("--dpt", type=float, default=1000.0, help="Dollars per trade")
+    p.add_argument("--fees", type=float, default=0.001, help="Per-order fee (e.g., 0.001 = 0.1%)")
+    p.add_argument("--slippage", type=float, default=0.0)
+    p.add_argument("--plot", action="store_true", help="Show matplotlib summary plot")
+    p.add_argument("--vb-plot", action="store_true", help="Show interactive vectorbt plot")
+    p.add_argument("--save-signals", type=str, default=None, help="Path to save signals CSV")
+    return p.parse_args()
+
+
+def params_from_args(a: argparse.Namespace) -> Params:
+    return Params(
+        sr_window_days=a.sr_days,
+        lookback_swings=a.lookback,
+        sfriz_window=a.zwin,
+        sfriz_swing_min=a.swing_z,
+        band_pct=a.band,
+        sfriz_bounce_long=a.bounce_long,
+        sfriz_bounce_short=a.bounce_short,
+        sfriz_breakout_lo=a.brk_lo,
+        sfriz_breakout_hi=a.brk_hi,
+        sl_pct=a.sl,
+        tp_pct=a.tp,
+        max_hold_bars=a.hold,
+        prefer_long_on_conflict=bool(a.prefer_long)
+    )
+
+
+def main():
+    args = parse_args()
+    freq = args.freq.upper()
+
+    # Load & prepare
+    df = load_data_from_csv(args.csv)
+    df = compute_sfri(df)
+    P = params_from_args(args)
+
+    # Backtest
+    pf, sig, long_exits, short_exits = run_backtest(
+        df, P, dollars_per_trade=args.dpt, fees=args.fees, slippage=args.slippage, tf_freq=freq
+    )
+
+    # Output
+    print("\n=== Portfolio Stats ===")
+    print(pf.stats())
+
+    # Save signals?
+    if args.save_signals:
+        out = pd.DataFrame({
+            'close': sig['close'],
+            'sfriz': sig['sfriz'],
+            'res_low': sig['res_low'],
+            'res_high': sig['res_high'],
+            'sup_low': sig['sup_low'],
+            'sup_high': sig['sup_high'],
+            'long_entry': sig['long_entries'].astype(bool),
+            'short_entry': sig['short_entries'].astype(bool),
+            'long_exit': long_exits.astype(bool),
+            'short_exit': short_exits.astype(bool),
+        })
+        out.to_csv(args.save_signals, index=True)
+        print(f"\nSignals saved to: {args.save_signals}")
+
+    # Plots
+    if args.vb_plot:
+        pf.plot().show()
+    if args.plot:
+        plot_strategy_chart(
+            df.index, sig['close'], sig['sfriz'],
+            sig['res_low'], sig['res_high'], sig['sup_low'], sig['sup_high'],
+            sig['long_entries'].values.astype(bool), long_exits.values.astype(bool),
+            sig['short_entries'].values.astype(bool), short_exits.values.astype(bool),
+            title=f"SFRI-weighted Long/Short S/R ({freq}, $100/trade)"
+        )
+
+
+if __name__ == "__main__":
+    main()
