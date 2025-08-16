@@ -1,0 +1,179 @@
+SFRI-weighted Support/Resistance Strategy 
+
+Research/education project implementing an S/R trading strategy weighted by Systemic Flow Resistance Index (SFRI).
+No financial advice. Use at your own risk.
+
+How the Strategy Works
+
+This project implements a repaint-safe long/short trading strategy that builds Support/Resistance (S/R) zones from swing pivots and filters trades with a Systemic Flow Resistance Index (SFRI) signal. 
+It is designed for bar-close operation (no intrabar look-ahead), portable across symbols/timeframes, and backtested with fixed $1000 per trade sizing.
+
+1) Inputs & Preprocessing
+
+Input data: OHLCV CSV with columns Open Time, Open, High, Low, Close, Volume.
+
+Index: Open Time is parsed as a timestamp and set as the DataFrame index, sorted ascending.
+
+SFRI field: If a SFRI column is missing, it is computed from OHLCV (see below).
+
+2) SFRI (Systemic Flow Resistance Index)
+
+SFRI is a simple, volume-aware market “effort vs. result” proxy. If absent, it is computed as:
+
+SFRI≈∣ΔP∣⋅(High−Low)Volume⋅∣ΔP∣+ε×10,000
+SFRI≈
+Volume⋅∣ΔP∣+ε
+∣ΔP∣⋅(High−Low)
+	​
+
+×10,000
+
+where 
+ΔP
+ΔP is the absolute close-to-close change, and 
+ε
+ε is a small constant to avoid division by zero.
+For conditioning we use the z-score of SFRI (SFRI_Z) over a rolling window (e.g., 72–96 bars on 4H), which centers and scales SFRI for comparability across time.
+
+Intuition:
+
+Large spreads with small volume/price change → higher SFRI (inefficient flow / resistance to movement).
+
+Small spreads with large volume/price change → lower SFRI (efficient flow / easier movement).
+
+3) Repaint-Safe Swing Pivots
+
+Strict pivot rule: The center bar must be strictly greater (swing high) or strictly lower (swing low) than all neighbors within a centered window of length 
+2⋅lookback+1
+2⋅lookback+1.
+
+Confirmation lag: Detected pivots are shifted forward by lookback bars before use. This removes look-ahead and ensures signals are only available after sufficient confirmation.
+
+SFRI filter at pivot: A pivot is only accepted if 
+∣SFRIZ∣
+∣SFRI
+Z
+	​
+
+∣ at the pivot meets a minimum threshold (e.g., sfriz_swing_min = 1.0), filtering out “weak” pivot points.
+
+4) Support/Resistance Zones
+
+From the most recent confirmed swing high/low, we derive rolling S/R levels and invalidate them if the last pivot is older than sr_window_days.
+
+Each level becomes a zone by expanding it up/down by band_pct (e.g., ±0.004 = ±0.4%).
+This accounts for market noise and avoids single-price “pinpointing”.
+
+5) Entry Logic (bar-close)
+
+We form two long and two short setups, with SFRI_Z context filters:
+
+Long entries
+
+Resistance breakout:
+
+Previous close ≤ (R × 
+1+band4
+1+
+4
+band
+	​
+
+), current close > that threshold.
+
+SFRI_Z is within a moderate band (e.g., sfriz_breakout_lo … sfriz_breakout_hi), avoiding extreme flow regimes.
+
+Support bounce:
+
+Price comes from below, enters the support zone, and current close stays within the zone.
+
+SFRI_Z ≤ sfriz_bounce_long (sufficiently negative), hinting at downside exhaustion.
+
+Short entries
+
+Resistance rejection:
+
+Price comes from above, enters the resistance zone, and current close stays within the zone.
+
+SFRI_Z ≥ sfriz_bounce_short (sufficiently positive), hinting at upside exhaustion.
+
+Support breakdown:
+
+Previous close ≥ (S × 
+1−band4
+1−
+4
+band
+	​
+
+), current close < that threshold.
+
+SFRI_Z is within the moderate band.
+
+Conflict resolution: If long and short trigger on the same bar, resolve deterministically (configurable, default: prefer long).
+
+6) Exit Logic (sequential per side)
+
+For each side (long and short tracked independently), the first condition to hit closes the position:
+
+Stop-loss: sl_pct (fraction of entry price; e.g., 0.03 = 3%)
+
+Take-profit: tp_pct (e.g., 0.08 = 8%)
+
+Max hold: max_hold_bars bars since entry
+
+Exits are simulated at bar closes in chronological order. Intrabar SL/TP fills are not modeled.
+
+7) Position Sizing & Costs
+
+Fixed dollar size: $1000 per trade by default → quantity = 1000 / Close on the entry bar.
+The same rule applies to long and short.
+
+Trading costs: Per-order fees (e.g., 0.001 = 0.1%) and optional slippage are applied by vectorbt.
+
+8) Backtesting & Realtime
+
+Backtest: Implemented with vectorbt.Portfolio.from_signals, using one size array for both long and short entries.
+
+Realtime (bar close): A helper realtime_step consumes the latest closed bar and returns one of:
+
+enter_long / enter_short (with qty, sl, tp) → place as OCO in your broker
+
+exit with reason ∈ {stop, take, time}
+
+hold
+Do not pass partially formed bars.
+
+9) Key Parameters (typical 4H defaults)
+
+sr_window_days: max age of valid pivots (e.g., 60–120)
+
+lookback_swings: pivot lookback / confirmation lag (1–3)
+
+sfriz_window: SFRI z-score window (≈ 72–96 on 4H)
+
+sfriz_swing_min: min |SFRI_Z| at pivot (0.5–1.0)
+
+band_pct: zone half-width (0.003–0.006 on 4H)
+
+sfriz_bounce_long, sfriz_bounce_short: bounce/rejection SFRI_Z thresholds
+
+sfriz_breakout_lo/hi: breakout SFRI_Z band
+
+sl_pct, tp_pct, max_hold_bars: exit rules
+
+10) What This Strategy Is / Is Not
+
+Is: A clean, bar-close, repaint-safe S/R framework with flow-aware filters and simple exits.
+
+Is not: A tick-accurate execution model; intrabar fills, partial fills, and liquidity constraints are not simulated.
+
+11) Tuning & Robustness
+
+Start with 4H: sfriz_window ≈ 72–96, band_pct ≈ 0.004–0.006, lookback_swings ∈ {1,2,3}.
+
+Validate with train/test split or walk-forward.
+
+Perform local sweeps around top candidates (e.g., band_pct in 0.0005 steps) to check stability.
+
+Monitor trade count, drawdown, Sharpe, and sensitivity to small parameter changes.
